@@ -78,6 +78,8 @@ class ModelDownloader {
   HttpClient? _client;
   HttpClientRequest? _request;
   StreamIterator<List<int>>? _body;
+  Future<void>? _bodyCancellation;
+  _DownloadCleanupFailure? _cleanupFailure;
   bool _cancelled = false;
   bool _closed = false;
   Future<void>? _operation;
@@ -94,6 +96,7 @@ class ModelDownloader {
 
   DownloadState get state => _state;
   Stream<DownloadState> get changes => _changes.stream;
+  bool get acceptsDownloads => !_closed;
 
   Future<void> downloadPackage({
     required ModelPackageSelection selection,
@@ -175,7 +178,10 @@ class ModelDownloader {
         packageSelection: current,
       );
     } catch (error) {
-      if (_cancelled) {
+      if (error is _DownloadCleanupFailure) {
+        _publish(DownloadStatus.failed, error: error.toString());
+        rethrow;
+      } else if (_cancelled) {
         _publish(DownloadStatus.cancelled);
       } else if (error is _DownloadFailure) {
         _publish(error.status, error: error.message);
@@ -501,7 +507,10 @@ class ModelDownloader {
       await stage.delete(recursive: true);
       _publish(DownloadStatus.installed, installationId: installationId);
     } catch (error) {
-      if (_cancelled) {
+      if (error is _DownloadCleanupFailure) {
+        _publish(DownloadStatus.failed, error: error.toString());
+        rethrow;
+      } else if (_cancelled) {
         _publish(DownloadStatus.cancelled);
       } else if (error is _DownloadFailure) {
         _publish(error.status, error: error.message);
@@ -514,11 +523,18 @@ class ModelDownloader {
         );
       }
     } finally {
-      await _body?.cancel();
-      _body = null;
-      _request = null;
-      _client?.close(force: true);
-      _client = null;
+      try {
+        await _cleanUp([
+          () async => await _bodyCancellation,
+          () async => await _body?.cancel(),
+          () => _client?.close(force: true),
+        ]);
+      } finally {
+        _body = null;
+        _bodyCancellation = null;
+        _request = null;
+        _client = null;
+      }
     }
   }
 
@@ -859,9 +875,15 @@ class ModelDownloader {
         _checkCancelled();
       }
     } finally {
-      await _body?.cancel();
-      _body = null;
-      await output.close();
+      try {
+        await _cleanUp([
+          () async => await _bodyCancellation,
+          () async => await _body?.cancel(),
+          output.close,
+        ]);
+      } finally {
+        _body = null;
+      }
     }
   }
 
@@ -911,13 +933,30 @@ class ModelDownloader {
         throw const _DownloadFailure(DownloadStatus.conflict, '安装记录已存在，未覆盖');
       }
     } catch (_) {
-      for (final (temporary, target) in linked.reversed) {
-        if (await FileSystemEntity.identical(temporary.path, target.path)) {
-          await target.delete();
-        }
-      }
+      await _cleanUp([
+        for (final (temporary, target) in linked.reversed)
+          () async {
+            if (await FileSystemEntity.identical(temporary.path, target.path)) {
+              await target.delete();
+            }
+          },
+      ]);
       rethrow;
     }
+  }
+
+  Future<void> _cleanUp(Iterable<FutureOr<void> Function()> releases) async {
+    for (final release in releases) {
+      try {
+        await release();
+      } catch (error) {
+        _cleanupFailure ??= error is _DownloadCleanupFailure
+            ? error
+            : _DownloadCleanupFailure(error);
+        _closed = true;
+      }
+    }
+    if (_cleanupFailure != null) throw _cleanupFailure!;
   }
 
   void _checkCancelled() {
@@ -931,7 +970,7 @@ class ModelDownloader {
     String? error,
     String? installationId,
   }) {
-    if (_closed) return;
+    if (_changes.isClosed) return;
     _state = DownloadState(
       status: status,
       repositoryId: _repositoryId,
@@ -955,9 +994,24 @@ class ModelDownloader {
   void cancel() {
     if (!_state.isActive) return;
     _cancelled = true;
-    _request?.abort(const _DownloadFailure(DownloadStatus.cancelled, '已取消'));
-    _body?.cancel();
-    _client?.close(force: true);
+    for (final release in <void Function()>[
+      () => _request?.abort(
+        const _DownloadFailure(DownloadStatus.cancelled, '已取消'),
+      ),
+      () {
+        _bodyCancellation ??= _body?.cancel().then<void>((_) {});
+        // The receive/download finalizers own and await this first cancellation.
+        _bodyCancellation?.ignore();
+      },
+      () => _client?.close(force: true),
+    ]) {
+      try {
+        release();
+      } catch (error) {
+        _cleanupFailure ??= _DownloadCleanupFailure(error);
+        _closed = true;
+      }
+    }
   }
 
   /// Seal new downloads and wait for owned file handles and installation
@@ -965,10 +1019,8 @@ class ModelDownloader {
   Future<void> close() => _closing ??= _finishClosing();
 
   Future<void> _finishClosing() async {
-    cancel();
     _closed = true;
-    await _operation;
-    await _changes.close();
+    await _cleanUp([cancel, () async => await _operation, _changes.close]);
   }
 }
 
@@ -1034,4 +1086,11 @@ class _DownloadFailure implements Exception {
   const _DownloadFailure(this.status, this.message);
   final DownloadStatus status;
   final String message;
+}
+
+class _DownloadCleanupFailure implements Exception {
+  const _DownloadCleanupFailure(this.cause);
+  final Object cause;
+  @override
+  String toString() => '下载清理未完成：$cause';
 }

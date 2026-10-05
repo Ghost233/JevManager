@@ -24,6 +24,126 @@ Future<McpClient> _client(Uri endpoint) async {
 }
 
 void main() {
+  test('a real installation rollback failure rejects exit after the remaining files and services are cleaned up', () async {
+    final runtime = await CouncilRuntime.create();
+    addTearDown(runtime.close);
+    final council = CouncilController(catalog: runtime.catalog);
+    addTearDown(council.close);
+    final mcp = CouncilMcpServer(controller: council, port: 0);
+    addTearDown(mcp.close);
+    await mcp.start();
+    final models = Directory('${runtime.root.path}/pending-download');
+    final formal = Directory('${models.path}/publisher/model');
+    await formal.create(recursive: true);
+    final shared = File('${formal.path}/Model-00001-of-00032.gguf');
+    await shared.writeAsString('abc');
+    final sharedModified = (await shared.stat()).modified;
+    late File removedTemporary;
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      if (request.uri.pathSegments.last == 'Model-00032-of-00032.gguf') {
+        removedTemporary =
+            (await Directory('${models.path}/.jevmanager/downloads')
+                        .list(recursive: true)
+                        .where(
+                          (entry) => entry.path.endsWith(
+                            '/Model-00003-of-00032.gguf.part',
+                          ),
+                        )
+                        .toList())
+                    .single
+                as File;
+      }
+      request.response.write('abc');
+      await request.response.close();
+    });
+    final downloader = ModelDownloader(
+      hfEndpoint: Uri.parse('http://127.0.0.1:${server.port}'),
+    );
+    addTearDown(() async {
+      // A rejected terminal close is expected for this deliberately damaged FS.
+      await downloader.close().then<void>((_) {}, onError: (Object _) {});
+    });
+    final manager = ManagerLifecycle(
+      council: council,
+      mcp: mcp,
+      engines: runtime.catalog,
+      downloader: downloader,
+    );
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(id: 'publisher/model'),
+      revision: '0123456789012345678901234567890123456789',
+      requestedRevision: 'main',
+      source: Uri.parse('http://127.0.0.1:${server.port}'),
+      files: [
+        for (var i = 1; i <= 32; i++)
+          HfModelFile(
+            path: 'Model-${i.toString().padLeft(5, '0')}-of-00032.gguf',
+            sizeBytes: 3,
+            sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+          ),
+      ],
+    );
+    final package = ModelPackage.discover(repository).single;
+    final shutdownStarted = Completer<void>();
+    Future<void>? shutdown;
+    var activeAtExit = false;
+    final changesFinished = Completer<void>();
+    final changes = downloader.changes.listen(
+      (_) {},
+      onDone: changesFinished.complete,
+    );
+    addTearDown(changes.cancel);
+    final blocked = File('${formal.path}/Model-00003-of-00032.gguf');
+    final watch = formal.watch(events: FileSystemEvent.create).listen((event) {
+      if (event.path == blocked.path && !shutdownStarted.isCompleted) {
+        activeAtExit = downloader.state.isActive;
+        // Interference at the real FS boundary makes rollback's identity check
+        // fail. Other newly linked files must still be removed safely.
+        removedTemporary.deleteSync();
+        shutdown = manager.shutdown();
+        shutdown!.ignore();
+        shutdownStarted.complete();
+      }
+    });
+    addTearDown(watch.cancel);
+    final transfer = downloader
+        .downloadPackage(
+          selection: package.selectVariant(package.variants.single.id),
+          currentRepository: repository,
+          libraryDirectory: models,
+        )
+        .then<Object?>((_) => null, onError: (Object error) => error);
+    await shutdownStarted.future.timeout(const Duration(seconds: 5));
+    await expectLater(
+      shutdown!.timeout(const Duration(seconds: 5)),
+      throwsStateError,
+    );
+    expect(activeAtExit, isTrue);
+    expect(await transfer, isNotNull);
+    expect(manager.state, ManagerLifecycleState.failed);
+    expect(manager.error, contains('下载'));
+    expect(manager.error, contains('Model-00003-of-00032.gguf.part'));
+    expect(changesFinished.isCompleted, isTrue);
+    expect(mcp.state.status, CouncilMcpStatus.stopped);
+    expect(runtime.io.killedChildren, 2);
+    expect((await formal.list().toList()).map((file) => file.path).toSet(), {
+      shared.path,
+      blocked.path,
+    });
+    expect(await shared.readAsString(), 'abc');
+    expect((await shared.stat()).modified, sharedModified);
+    final receipts = Directory('${models.path}/.jevmanager/installations');
+    expect(
+      await receipts.exists()
+          ? await receipts.list().toList()
+          : <FileSystemEntity>[],
+      isEmpty,
+    );
+    await expectLater(downloader.close(), throwsA(isA<Exception>()));
+  });
+
   test('explicit exit during installation waits for rollback and preserves the identical shared file', () async {
     final runtime = await CouncilRuntime.create(modelCount: 0);
     addTearDown(runtime.close);

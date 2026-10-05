@@ -10,6 +10,98 @@ import 'package:jev_manager/model_downloader.dart';
 import 'package:jev_manager/model_package.dart';
 
 void main() {
+  test('a desktop task handles a terminal cleanup failure while preserving failed state and rejecting new attempts', () async {
+    const revision = '0123456789012345678901234567890123456789';
+    final directory = await Directory.systemTemp.createTemp('task-cleanup-');
+    final formal = Directory('${directory.path}/publisher/model');
+    await formal.create(recursive: true);
+    late File removedTemporary;
+    final requests = <String>[];
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      requests.add(request.uri.path);
+      if (request.uri.pathSegments.last == 'Model-00032-of-00032.gguf') {
+        removedTemporary =
+            (await Directory('${directory.path}/.jevmanager/downloads')
+                        .list(recursive: true)
+                        .where(
+                          (entry) => entry.path.endsWith(
+                            '/Model-00002-of-00032.gguf.part',
+                          ),
+                        )
+                        .toList())
+                    .single
+                as File;
+      }
+      request.response.write('abc');
+      await request.response.close();
+    });
+    final endpoint = Uri.parse('http://127.0.0.1:${server.port}');
+    final downloader = ModelDownloader(hfEndpoint: endpoint);
+    final preferences = DownloadPreferences(
+      file: File('${directory.path}/preferences.json'),
+    );
+    final tasks = DownloadTaskController(
+      downloader: downloader,
+      preferences: preferences,
+    );
+    addTearDown(() async {
+      await downloader.close().then<void>((_) {}, onError: (Object _) {});
+      preferences.dispose();
+      await server.close(force: true);
+      await directory.delete(recursive: true);
+    });
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(id: 'publisher/model'),
+      revision: revision,
+      requestedRevision: 'main',
+      source: endpoint,
+      files: [
+        for (var i = 1; i <= 32; i++)
+          HfModelFile(
+            path: 'Model-${i.toString().padLeft(5, '0')}-of-00032.gguf',
+            sizeBytes: 3,
+            sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+          ),
+      ],
+    );
+    final package = ModelPackage.discover(repository).single;
+    final selection = package.selectVariant(package.variants.single.id);
+    final damaged = Completer<void>();
+    final watch = formal.watch(events: FileSystemEvent.create).listen((event) {
+      if (event.path.endsWith('/Model-00002-of-00032.gguf') &&
+          !damaged.isCompleted) {
+        removedTemporary.deleteSync();
+        downloader.cancel();
+        damaged.complete();
+      }
+    });
+    addTearDown(watch.cancel);
+    final task = tasks.start(
+      selection: selection,
+      currentRepository: repository,
+      libraryPath: directory.path,
+    );
+    final handled = expectLater(task, completes);
+    await damaged.future.timeout(const Duration(seconds: 5));
+    await handled;
+    expect(downloader.state.status, DownloadStatus.failed);
+    expect(downloader.state.error, contains('下载清理未完成'));
+    expect(tasks.canRetry, isFalse);
+    final requestCount = requests.length;
+    await tasks.retry();
+    final nextPath = '${directory.path}/another-library';
+    await tasks.start(
+      selection: selection,
+      currentRepository: repository,
+      libraryPath: nextPath,
+    );
+    expect(requests, hasLength(requestCount));
+    expect(await Directory(nextPath).exists(), isFalse);
+    expect(downloader.state.status, DownloadStatus.failed);
+    await expectLater(downloader.close(), throwsA(isA<Exception>()));
+  });
+
   test(
     'changing download settings affects the next task, not cancelled resume',
     () async {

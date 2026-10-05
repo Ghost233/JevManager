@@ -18,14 +18,17 @@ class DownloadTaskController {
   String? _libraryPath;
   DownloadSource? _source;
 
-  bool get canRetry => _selection != null && !downloader.state.isActive;
+  bool get canRetry =>
+      _selection != null &&
+      downloader.acceptsDownloads &&
+      !downloader.state.isActive;
 
   Future<void> start({
     required ModelPackageSelection selection,
     required HfRepositoryFiles currentRepository,
     required String libraryPath,
   }) async {
-    if (downloader.state.isActive) return;
+    if (!downloader.acceptsDownloads || downloader.state.isActive) return;
     _selection = selection;
     _repository = currentRepository;
     _libraryPath = libraryPath;
@@ -38,13 +41,24 @@ class DownloadTaskController {
     await _run(restart: restart);
   }
 
-  Future<void> _run({bool restart = false}) => downloader.downloadPackage(
-    selection: _selection!,
-    currentRepository: _repository!,
-    libraryDirectory: Directory(_libraryPath!),
-    source: _source!,
-    restart: restart,
-  );
+  Future<void> _run({bool restart = false}) async {
+    try {
+      await downloader.downloadPackage(
+        selection: _selection!,
+        currentRepository: _repository!,
+        libraryDirectory: Directory(_libraryPath!),
+        source: _source!,
+        restart: restart,
+      );
+    } catch (_) {
+      // The desktop displays terminal cleanup failure through downloader state.
+      // The owning downloader still rejects close/manager shutdown with it.
+      if (downloader.acceptsDownloads ||
+          downloader.state.status != DownloadStatus.failed) {
+        rethrow;
+      }
+    }
+  }
 }
 
 /// The selected package has one action; configuration lives in Settings.
@@ -85,6 +99,7 @@ class DownloadPanel extends StatelessWidget {
         final repository = browserSnapshot.data!.repository;
         final variant = _variant;
         final canDownload =
+            downloads.downloader.acceptsDownloads &&
             !snapshot.data!.isActive &&
             libraryPath.isNotEmpty &&
             browserSnapshot.data!.repositoryStatus == RequestStatus.ready &&

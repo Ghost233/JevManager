@@ -146,7 +146,8 @@ class _ManagerShellState extends State<_ManagerShell> {
   void dispose() {
     _native.setMethodCallHandler(null);
     _browser.close();
-    unawaited(_downloader.close());
+    // Explicit native shutdown awaits the original failure via ManagerLifecycle.
+    unawaited(_downloader.close().catchError((Object _) {}));
     _mcp.close();
     _council.close();
     _engines.close();
