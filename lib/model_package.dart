@@ -295,11 +295,22 @@ List<HfModelFile> resolveAssetFiles(
             isWeightIndexFile(file.path),
       );
   final directories = <String>{''};
+  final componentDirectories = <String>{};
   for (final file in selected) {
     validateAssetPath(file.path);
     final slash = file.path.lastIndexOf('/');
     final directory = slash < 0 ? '' : file.path.substring(0, slash + 1);
     directories.add(directory);
+    if (RegExp(r'\.(safetensors|bin)(?:\.index\.json)?$').hasMatch(file.path) &&
+        available.any(
+          (item) => item.path == '${directory}rl_agent_config.json',
+        )) {
+      paths.add('${directory}rl_agent_config.json');
+      componentDirectories.addAll([
+        '${directory}encoder/',
+        '${directory}tokenizer/',
+      ]);
+    }
     final name = file.path.substring(slash + 1);
     final split = RegExp(r'^(.+)-(\d{5})-of-(\d{5})\.(gguf|safetensors|bin)$')
         .firstMatch(name);
@@ -324,7 +335,8 @@ List<HfModelFile> resolveAssetFiles(
     final directory = slash < 0 ? '' : file.path.substring(0, slash + 1);
     final name = file.path.substring(slash + 1);
     if (needsSidecars &&
-        directories.contains(directory) &&
+        (directories.contains(directory) ||
+            componentDirectories.contains(directory)) &&
         (_sidecarNames.contains(name) ||
             RegExp(
               r'^(decision_head|head|classifier)\.(safetensors|bin|pt|pth|npz|onnx)$',

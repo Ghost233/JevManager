@@ -5,12 +5,84 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jev_manager/hf_model_browser.dart';
 import 'package:jev_manager/model_downloader.dart';
+import 'package:jev_manager/model_package.dart';
 
 const _revision = '0123456789012345678901234567890123456789';
 const _abcSha256 =
     'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
 
 void main() {
+  test('closing an active package drains cancellation before returning and seals new downloads', () async {
+    final directory = await Directory.systemTemp.createTemp(
+      'jev-download-close-',
+    );
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    server.listen((request) async {
+      request.response.add(utf8.encode('abc'));
+      await request.response.close();
+    });
+    final endpoint = Uri.parse('http://127.0.0.1:${server.port}');
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(id: 'publisher/model'),
+      revision: _revision,
+      requestedRevision: 'main',
+      source: endpoint,
+      files: const [
+        HfModelFile(path: 'model.gguf', sizeBytes: 3, sha256: _abcSha256),
+      ],
+    );
+    final downloader = ModelDownloader(hfEndpoint: endpoint);
+    final closingRequested = Completer<void>();
+    Future<void>? closing;
+    var transferFinished = false;
+    final subscription = downloader.changes.listen((state) {
+      if (state.status == DownloadStatus.downloading &&
+          state.downloadedBytes == 3 &&
+          !closingRequested.isCompleted) {
+        scheduleMicrotask(() {
+          closing = Future<void>.sync(downloader.close);
+          closingRequested.complete();
+        });
+      }
+    });
+    addTearDown(() async {
+      await subscription.cancel();
+      await Future<void>.sync(downloader.close);
+      await server.close(force: true);
+      await directory.delete(recursive: true);
+    });
+    final selection = ModelPackage.discover(repository).single
+        .selectVariant('GGUF:model');
+    final transfer = downloader
+        .downloadPackage(
+          selection: selection,
+          currentRepository: repository,
+          libraryDirectory: directory,
+        )
+        .whenComplete(() => transferFinished = true);
+    await closingRequested.future.timeout(const Duration(seconds: 3));
+    await closing!;
+    expect(
+      transferFinished,
+      isTrue,
+      reason: 'The shell can exit only after cancellation and file cleanup have settled',
+    );
+    await transfer;
+    expect(
+      await File('${directory.path}/publisher/model/model.gguf').exists(),
+      isFalse,
+    );
+    await downloader.downloadPackage(
+      selection: selection,
+      currentRepository: repository,
+      libraryDirectory: directory,
+    );
+    expect(
+      await File('${directory.path}/publisher/model/model.gguf').exists(),
+      isFalse,
+    );
+  });
+
   test(
     'installs only selected fixed-revision assets with exact lineage',
     () async {

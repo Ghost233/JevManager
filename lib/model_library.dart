@@ -487,7 +487,10 @@ Future<List<LibraryArtifact>> _applyManifests(
         value['repoId'] is! String ||
         value['revision'] is! String ||
         !RegExp(r'^[0-9a-fA-F]{40}$').hasMatch(value['revision'] as String) ||
-        !['hf', 'lmStudio'].contains(value['source']) ||
+        !['hf', 'lmStudio', 'local'].contains(value['source']) ||
+        (value['source'] == 'local' &&
+            (value['reusedExisting'] != true ||
+                value['sourceTransferPerformed'] != false)) ||
         value['files'] is! List) {
       continue;
     }

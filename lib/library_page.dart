@@ -30,6 +30,7 @@ class _LibraryPageState extends State<LibraryPage> {
   final _selected = <String>{};
   final _variantIds = <String, String>{};
   final _expanded = <String>{};
+  final _stopping = <String>{};
   final _filter = TextEditingController();
   LibraryState? _packageState;
   String? _packagePath;
@@ -585,6 +586,8 @@ class _LibraryPageState extends State<LibraryPage> {
 
   Widget _runRow(EngineRun run, bool busy) {
     final instance = run.instance;
+    final stopKey = '${run.engine.id}:${instance.id}';
+    final stopping = _stopping.contains(stopKey);
     final active =
         instance.status == LlamaInstanceStatus.ready ||
         instance.status == LlamaInstanceStatus.starting;
@@ -600,13 +603,17 @@ class _LibraryPageState extends State<LibraryPage> {
               Text(run.engine.name, style: theme.textTheme.bodySmall),
               const SizedBox(width: 10),
               JevStatusChip(
-                label: switch (instance.status) {
-                  LlamaInstanceStatus.starting => '启动中',
-                  LlamaInstanceStatus.ready => '运行中',
-                  LlamaInstanceStatus.stopped => '已停止',
-                  LlamaInstanceStatus.failed => '失败',
-                },
-                tone: failure
+                label: stopping
+                    ? '停止中'
+                    : switch (instance.status) {
+                        LlamaInstanceStatus.starting => '启动中',
+                        LlamaInstanceStatus.ready => '运行中',
+                        LlamaInstanceStatus.stopped => '已停止',
+                        LlamaInstanceStatus.failed => '失败',
+                      },
+                tone: stopping
+                    ? JevStatusTone.neutral
+                    : failure
                     ? JevStatusTone.error
                     : instance.status == LlamaInstanceStatus.ready
                     ? JevStatusTone.success
@@ -615,9 +622,13 @@ class _LibraryPageState extends State<LibraryPage> {
               const Spacer(),
               if (active)
                 TextButton(
-                  onPressed: busy
+                  onPressed: busy || stopping
                       ? null
                       : () async {
+                          setState(() {
+                            _stopping.add(stopKey);
+                            _operationError = null;
+                          });
                           try {
                             await widget.engines!
                                 .providerFor(run.engine.id)
@@ -628,9 +639,13 @@ class _LibraryPageState extends State<LibraryPage> {
                                 () => _operationError = error.toString(),
                               );
                             }
+                          } finally {
+                            if (mounted) {
+                              setState(() => _stopping.remove(stopKey));
+                            }
                           }
                         },
-                  child: const Text('停止'),
+                  child: Text(stopping ? '停止中' : '停止'),
                 ),
             ],
           ),

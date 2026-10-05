@@ -94,12 +94,12 @@ class _ManagerShellState extends State<_ManagerShell> {
       council: _council,
       mcp: _mcp,
       engines: _engines,
+      downloader: _downloader,
     );
     _native.setMethodCallHandler((call) async {
       if (call.method != 'prepareToQuit') throw MissingPluginException();
       try {
         await _lifecycle.shutdown();
-        _downloader.close();
         return true;
       } catch (_) {
         throw PlatformException(
@@ -146,7 +146,7 @@ class _ManagerShellState extends State<_ManagerShell> {
   void dispose() {
     _native.setMethodCallHandler(null);
     _browser.close();
-    _downloader.close();
+    unawaited(_downloader.close());
     _mcp.close();
     _council.close();
     _engines.close();

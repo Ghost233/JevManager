@@ -67,6 +67,9 @@ void main() {
       });
       addTearDown(() async {
         await tester.runAsync(() async {
+          if (io.stopRelease != null && !io.stopRelease!.isCompleted) {
+            io.stopRelease!.complete();
+          }
           await catalog.stopManaged();
           catalog.close();
           original.close();
@@ -154,13 +157,47 @@ void main() {
         library.prepareDeletion([library.state.artifacts.single.id]),
         throwsA(isA<LibraryException>()),
       );
+      io.stopFailure = true;
+      await tester.runAsync(() async {
+        await tester.tap(find.widgetWithText(TextButton, '停止'));
+        await _settleFilesystemFrames(tester);
+      });
+      expect(find.text('Bad state: provider refused stop'), findsOneWidget);
+      expect(
+        tester
+            .widget<TextButton>(find.widgetWithText(TextButton, '停止'))
+            .onPressed,
+        isNotNull,
+      );
+      io.stopRelease = Completer<void>();
+      io.stopRequested = Completer<void>();
       await tester.runAsync(() async {
         final stopped = catalog.changes.firstWhere(
           (_) =>
               fresh.state.instances.single.status ==
               LlamaInstanceStatus.stopped,
         );
+        await tester.ensureVisible(find.widgetWithText(TextButton, '停止'));
+        await tester.pumpAndSettle();
         await tester.tap(find.widgetWithText(TextButton, '停止'));
+        await tester.pump();
+        await io.stopRequested!.future.timeout(const Duration(seconds: 3));
+        await tester.pump();
+        expect(find.text('运行中'), findsNothing);
+        final pendingStop = find.widgetWithText(TextButton, '停止中');
+        expect(pendingStop, findsOneWidget);
+        expect(tester.widget<TextButton>(pendingStop).onPressed, isNull);
+        await tester.tap(pendingStop);
+        expect(io.stopAttempts, 2);
+        io.stopRelease!.complete();
+        for (var n = 0; n < 200; n++) {
+          await tester.pump();
+          if (fresh.state.instances.single.status ==
+              LlamaInstanceStatus.stopped) {
+            break;
+          }
+          await Future<void>.delayed(const Duration(milliseconds: 5));
+        }
         await stopped.timeout(const Duration(seconds: 5));
         expect(
           (await library.prepareDeletion([library.state.artifacts.single.id]))
@@ -192,6 +229,10 @@ Future<void> _settleFilesystemFrames(WidgetTester tester) async {
 }
 
 class _RuntimeIO implements EngineProcessIO {
+  bool stopFailure = false;
+  int stopAttempts = 0;
+  Completer<void>? stopRelease;
+  Completer<void>? stopRequested;
   @override
   Future<EngineCommandResult> run(
     String executable,
@@ -253,13 +294,14 @@ class _RuntimeIO implements EngineProcessIO {
       }
       await request.response.close();
     });
-    return _RuntimeChild(server);
+    return _RuntimeChild(server, this);
   }
 }
 
 class _RuntimeChild implements EngineChild {
-  _RuntimeChild(this.server);
+  _RuntimeChild(this.server, this.io);
   final HttpServer server;
+  final _RuntimeIO io;
   final stopped = Completer<int>();
   @override
   int get pid => 42421;
@@ -271,7 +313,16 @@ class _RuntimeChild implements EngineChild {
   Stream<List<int>> get stderr => const Stream.empty();
   @override
   bool kill(ProcessSignal signal) {
-    server.close(force: true).then((_) {
+    io.stopAttempts++;
+    if (io.stopFailure) {
+      io.stopFailure = false;
+      throw StateError('provider refused stop');
+    }
+    if (io.stopRequested != null && !io.stopRequested!.isCompleted) {
+      io.stopRequested!.complete();
+    }
+    server.close(force: true).then((_) async {
+      await io.stopRelease?.future;
       if (!stopped.isCompleted) stopped.complete(0);
     });
     return true;

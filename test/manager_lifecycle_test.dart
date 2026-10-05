@@ -6,8 +6,11 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:jev_manager/council.dart';
 import 'package:jev_manager/council_mcp.dart';
 import 'package:jev_manager/engine_catalog.dart';
+import 'package:jev_manager/hf_model_browser.dart';
 import 'package:jev_manager/manager_lifecycle.dart';
 import 'package:jev_manager/llama_engine.dart';
+import 'package:jev_manager/model_downloader.dart';
+import 'package:jev_manager/model_package.dart';
 import 'package:mcp_dart/mcp_dart.dart';
 
 import 'fixtures/council_runtime.dart';
@@ -21,6 +24,89 @@ Future<McpClient> _client(Uri endpoint) async {
 }
 
 void main() {
+  test('explicit exit during installation waits for rollback and preserves the identical shared file', () async {
+    final runtime = await CouncilRuntime.create(modelCount: 0);
+    addTearDown(runtime.close);
+    final council = CouncilController(catalog: runtime.catalog);
+    addTearDown(council.close);
+    final mcp = CouncilMcpServer(controller: council, port: 0);
+    addTearDown(mcp.close);
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((request) async {
+      request.response.write('abc');
+      await request.response.close();
+    });
+    final downloader = ModelDownloader(
+      hfEndpoint: Uri.parse('http://127.0.0.1:${server.port}'),
+    );
+    addTearDown(downloader.close);
+    final manager = ManagerLifecycle(
+      council: council,
+      mcp: mcp,
+      engines: runtime.catalog,
+      downloader: downloader,
+    );
+    final models = Directory('${runtime.root.path}/pending-download');
+    final formal = Directory('${models.path}/publisher/model');
+    await formal.create(recursive: true);
+    final shared = File('${formal.path}/Model-00001-of-00032.gguf');
+    await shared.writeAsString('abc');
+    final sharedModified = (await shared.stat()).modified;
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(id: 'publisher/model'),
+      revision: '0123456789012345678901234567890123456789',
+      requestedRevision: 'main',
+      source: Uri.parse('http://127.0.0.1:${server.port}'),
+      files: [
+        for (var i = 1; i <= 32; i++)
+          HfModelFile(
+            path: 'Model-${i.toString().padLeft(5, '0')}-of-00032.gguf',
+            sizeBytes: 3,
+            sha256: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+          ),
+      ],
+    );
+    final package = ModelPackage.discover(repository).single;
+    final shutdownStarted = Completer<void>();
+    Future<void>? shutdown;
+    var activeAtExit = false;
+    var transferFinished = false;
+    final watch = formal.watch(events: FileSystemEvent.create).listen((event) {
+      if (event.path.endsWith('.gguf') && !shutdownStarted.isCompleted) {
+        activeAtExit = downloader.state.isActive;
+        shutdown = manager.shutdown();
+        shutdownStarted.complete();
+      }
+    });
+    addTearDown(watch.cancel);
+    final transfer = downloader
+        .downloadPackage(
+          selection: package.selectVariant(package.variants.single.id),
+          currentRepository: repository,
+          libraryDirectory: models,
+        )
+        .whenComplete(() => transferFinished = true);
+    await shutdownStarted.future.timeout(const Duration(seconds: 5));
+    await shutdown!.timeout(const Duration(seconds: 5));
+    expect(activeAtExit, isTrue);
+    expect(transferFinished, isTrue);
+    await transfer;
+    expect(manager.state, ManagerLifecycleState.stopped);
+    expect((await formal.list().toList()).map((file) => file.path), [
+      shared.path,
+    ]);
+    expect(await shared.readAsString(), 'abc');
+    expect((await shared.stat()).modified, sharedModified);
+    final receipts = Directory('${models.path}/.jevmanager/installations');
+    expect(
+      await receipts.exists()
+          ? await receipts.list().toList()
+          : <FileSystemEntity>[],
+      isEmpty,
+    );
+  });
+
   test('explicit shutdown drains desktop and two MCP callers, rejects new work and preserves a foreign endpoint', () async {
     final runtime = await CouncilRuntime.create();
     addTearDown(runtime.close);
@@ -44,6 +130,7 @@ void main() {
       council: council,
       mcp: mcp,
       engines: runtime.catalog,
+      downloader: ModelDownloader(),
     );
     runtime.io.holdConsultation();
     final desktop = council.consult(
@@ -140,6 +227,7 @@ void main() {
       council: council,
       mcp: mcp,
       engines: runtime.catalog,
+      downloader: ModelDownloader(),
     );
     io.hold = true;
     final starting = runtime.engine
@@ -173,6 +261,7 @@ void main() {
       council: council,
       mcp: mcp,
       engines: runtime.catalog,
+      downloader: ModelDownloader(),
     );
     final queued = mcp.start();
     queued.ignore();
@@ -202,6 +291,7 @@ void main() {
       council: council,
       mcp: mcp,
       engines: runtime.catalog,
+      downloader: ModelDownloader(),
     );
 
     final attempt = manager.shutdown();
@@ -229,6 +319,7 @@ void main() {
       council: council,
       mcp: mcp,
       engines: runtime.catalog,
+      downloader: ModelDownloader(),
     );
     final exiting = Completer<Future<void>>();
     final subscription = runtime.library.changes.listen((state) {

@@ -1,6 +1,7 @@
 import 'council.dart';
 import 'council_mcp.dart';
 import 'engine_catalog.dart';
+import 'model_downloader.dart';
 
 enum ManagerLifecycleState { running, stopping, stopped, failed }
 
@@ -9,10 +10,12 @@ class ManagerLifecycle {
     required this.council,
     required this.mcp,
     required this.engines,
+    required this.downloader,
   });
   final CouncilController council;
   final CouncilMcpServer mcp;
   final EngineCatalog engines;
+  final ModelDownloader downloader;
   ManagerLifecycleState state = ManagerLifecycleState.running;
   String? error;
   Future<void>? _shutdown;
@@ -24,15 +27,18 @@ class ManagerLifecycle {
     state = ManagerLifecycleState.stopping;
     council.beginShutdown();
     engines.beginShutdown();
-    return _shutdown = _finish();
+    final downloads = downloader.close();
+    downloads.ignore();
+    return _shutdown = _finish(downloads);
   }
 
-  Future<void> _finish() async {
+  Future<void> _finish(Future<void> downloads) async {
     final failures = <String>[];
     for (final step in [
       ('MCP', mcp.stop),
       ('委员会', council.shutdown),
       ('引擎', engines.shutdown),
+      ('下载', () => downloads),
     ]) {
       try {
         await step.$2();

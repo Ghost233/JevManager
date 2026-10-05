@@ -80,6 +80,8 @@ class ModelDownloader {
   StreamIterator<List<int>>? _body;
   bool _cancelled = false;
   bool _closed = false;
+  Future<void>? _operation;
+  Future<void>? _closing;
   String? _repositoryId;
   String? _revision;
   String? _currentFile;
@@ -99,6 +101,22 @@ class ModelDownloader {
     required Directory libraryDirectory,
     DownloadSource source = DownloadSource.hf,
     bool restart = false,
+  }) => _run(
+    () => _downloadPackage(
+      selection: selection,
+      currentRepository: currentRepository,
+      libraryDirectory: libraryDirectory,
+      source: source,
+      restart: restart,
+    ),
+  );
+
+  Future<void> _downloadPackage({
+    required ModelPackageSelection selection,
+    required HfRepositoryFiles currentRepository,
+    required Directory libraryDirectory,
+    required DownloadSource source,
+    required bool restart,
   }) async {
     if (_closed || _state.isActive) return;
     _packageSelection = selection;
@@ -142,8 +160,7 @@ class ModelDownloader {
       if (currentRepository.summary.id.startsWith('.jevmanager/')) {
         throw const FormatException('仓库名与应用元数据目录冲突');
       }
-      if (current.variant.resolution == PackageResolution.resolved &&
-          await _reuseInstalledPackage(current, libraryDirectory)) {
+      if (await _reuseInstalledPackage(current, libraryDirectory)) {
         return;
       }
       _checkCancelled();
@@ -177,13 +194,34 @@ class ModelDownloader {
     required Directory libraryDirectory,
     DownloadSource source = DownloadSource.hf,
     bool restart = false,
-  }) => _downloadFiles(
-    repository: repository,
-    selectedFilePaths: selectedFilePaths,
-    libraryDirectory: libraryDirectory,
-    source: source,
-    restart: restart,
+  }) => _run(
+    () => _downloadFiles(
+      repository: repository,
+      selectedFilePaths: selectedFilePaths,
+      libraryDirectory: libraryDirectory,
+      source: source,
+      restart: restart,
+    ),
   );
+
+  Future<void> _run(Future<void> Function() action) {
+    if (_closed || _operation != null) return Future<void>.value();
+    final operation = Completer<void>();
+    _operation = operation.future;
+    unawaited(
+      Future<void>.sync(action).then<void>(
+        (_) {
+          _operation = null;
+          operation.complete();
+        },
+        onError: (Object error, StackTrace stack) {
+          _operation = null;
+          operation.completeError(error, stack);
+        },
+      ),
+    );
+    return operation.future;
+  }
 
   Future<void> _downloadFiles({
     required HfRepositoryFiles repository,
@@ -492,7 +530,54 @@ class ModelDownloader {
     final root = Directory(await libraryDirectory.resolveSymbolicLinks());
     _libraryPath = root.path;
     final repository = selection.modelPackage.repository;
-    final files = selection.variant.files;
+    final files = selection.variant.files.toList();
+    // Expand from the installed index rather than trusting a receipt's file
+    // list. Every expanded file is still checked against the fixed metadata.
+    for (var i = 0; i < files.length; i++) {
+      final file = files[i];
+      if (!isWeightIndexFile(file.path)) continue;
+      _checkCancelled();
+      final index = File('${root.path}/${repository.summary.id}/${file.path}');
+      final type = await FileSystemEntity.type(index.path, followLinks: false);
+      if (type == FileSystemEntityType.notFound) return false;
+      if (type != FileSystemEntityType.file ||
+          await index.resolveSymbolicLinks() != index.path) {
+        throw const _DownloadFailure(
+          DownloadStatus.conflict,
+          '现有权重索引是目录或链接，未修改',
+        );
+      }
+      try {
+        final data = jsonDecode(await index.readAsString());
+        final weights = data is Map ? data['weight_map'] : null;
+        if (weights is! Map ||
+            weights.isEmpty ||
+            weights.values.any((value) => value is! String)) {
+          throw const FormatException('无效 weight_map');
+        }
+        final slash = file.path.lastIndexOf('/');
+        final prefix = slash < 0 ? '' : file.path.substring(0, slash + 1);
+        for (final weight in weights.values.toSet().cast<String>()) {
+          validateAssetPath(weight);
+          final matches = repository.files.where(
+            (item) => item.path == '$prefix$weight',
+          );
+          if (matches.length != 1) throw const FormatException('索引引用不属于此版本');
+          if (!files.any((item) => item.path == matches.single.path)) {
+            files.add(matches.single);
+          }
+        }
+      } on FormatException {
+        throw const _DownloadFailure(
+          DownloadStatus.conflict,
+          '现有权重索引与固定模型包不一致，未修改',
+        );
+      }
+    }
+    files.sort((a, b) => a.path.compareTo(b.path));
+    _totalBytes = files.every((file) => file.sizeBytes != null)
+        ? files.fold<int>(0, (sum, file) => sum + file.sizeBytes!)
+        : null;
     final id = sha256
         .convert(
           utf8.encode(
@@ -509,18 +594,58 @@ class ModelDownloader {
     );
     Map<String, dynamic>? manifest;
     if (await manifestFile.exists()) {
+      if (await manifestFile.resolveSymbolicLinks() != manifestFile.path) {
+        throw const _DownloadFailure(DownloadStatus.conflict, '安装记录是链接，未修改');
+      }
       try {
         final data = jsonDecode(await manifestFile.readAsString());
+        final metadata = {
+          for (final file in files)
+            '${repository.summary.id}/${file.path}': file,
+        };
+        final rows = data is Map && data['files'] is List
+            ? data['files'] as List
+            : null;
+        final validRows =
+            rows != null &&
+            rows.length == files.length &&
+            rows.map((row) => row is Map ? row['path'] : null).toSet().length ==
+                files.length &&
+            rows.every((row) {
+              if (row is! Map) return false;
+              final file = metadata[row['path']];
+              return file != null &&
+                  row['sizeBytes'] is int &&
+                  row['sizeBytes'] >= 0 &&
+                  (file.sizeBytes == null ||
+                      row['sizeBytes'] == file.sizeBytes) &&
+                  row['sha256'] is String &&
+                  RegExp(r'^[0-9a-fA-F]{64}$')
+                      .hasMatch(row['sha256'] as String) &&
+                  row['upstreamSha256'] == file.sha256 &&
+                  row['gitBlobId'] == file.blobId &&
+                  row['isLfs'] == file.isLfs;
+            });
         if (data is Map<String, dynamic> &&
             data['version'] == 1 &&
             data['id'] == id &&
             data['repoId'] == repository.summary.id &&
             data['revision'] == repository.revision &&
-            data['files'] is List) {
+            ['hf', 'lmStudio', 'local'].contains(data['source']) &&
+            (data['source'] != 'local' ||
+                (data['reusedExisting'] == true &&
+                    data['sourceTransferPerformed'] == false)) &&
+            validRows) {
           manifest = data;
         }
       } on FormatException {
         // A malformed record does not prove that a package is installed.
+      }
+      if (manifest == null) {
+        throw const _DownloadFailure(
+          DownloadStatus.conflict,
+          '安装记录与固定模型包不一致，未修改',
+        );
       }
     }
     final records = <Map<String, dynamic>>[];
@@ -535,7 +660,8 @@ class ModelDownloader {
         allPresent = false;
         continue;
       }
-      if (type != FileSystemEntityType.file) {
+      if (type != FileSystemEntityType.file ||
+          await target.resolveSymbolicLinks() != target.path) {
         throw _DownloadFailure(
           DownloadStatus.conflict,
           '$relative 已是目录或链接，未修改',
@@ -557,7 +683,9 @@ class ModelDownloader {
       if ((file.sizeBytes != null && size != file.sizeBytes) ||
           (file.sha256 != null && digest != file.sha256!.toLowerCase()) ||
           (checksGit && gitDigest != file.blobId!.toLowerCase()) ||
-          (saved != null && digest != saved['sha256'])) {
+          (saved != null &&
+              (digest != (saved['sha256'] as String).toLowerCase() ||
+                  size != saved['sizeBytes']))) {
         throw _DownloadFailure(
           DownloadStatus.conflict,
           '$relative 现有内容与固定版本不一致，未修改',
@@ -832,10 +960,15 @@ class ModelDownloader {
     _client?.close(force: true);
   }
 
-  void close() {
+  /// Seal new downloads and wait for owned file handles and installation
+  /// rollback before the application exits.
+  Future<void> close() => _closing ??= _finishClosing();
+
+  Future<void> _finishClosing() async {
     cancel();
     _closed = true;
-    _changes.close();
+    await _operation;
+    await _changes.close();
   }
 }
 

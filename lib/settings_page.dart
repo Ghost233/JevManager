@@ -128,12 +128,15 @@ class _SettingsPageState extends State<SettingsPage> {
                       children: [
                         Text('存放位置', style: theme.textTheme.bodyMedium),
                         const SizedBox(height: 6),
-                        Text(
-                          widget.libraryPath,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: theme.textTheme.bodySmall?.copyWith(
-                            color: theme.colorScheme.onSurfaceVariant,
+                        Tooltip(
+                          message: widget.libraryPath,
+                          child: Text(
+                            widget.libraryPath,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: theme.textTheme.bodySmall?.copyWith(
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
                           ),
                         ),
                       ],

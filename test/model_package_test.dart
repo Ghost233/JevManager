@@ -1,14 +1,176 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:jev_manager/hf_model_browser.dart';
 import 'package:jev_manager/model_downloader.dart';
+import 'package:jev_manager/model_library.dart';
 import 'package:jev_manager/model_package.dart';
+
+import 'fixtures/decision_gguf.dart';
 
 const _revision = '0123456789012345678901234567890123456789';
 
 void main() {
+  test('the fixed native Laya package includes its complete tokenizer and encoder configuration only', () async {
+    // Primary HF metadata snapshot, retrieved at this immutable revision.
+    const revision = '1720e3e3357cfe1e281542e223f8273b0890ca34';
+    final metadata = await File(
+      'test/fixtures/hf_laya_multilingual_1720e3e.json',
+    ).readAsString();
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final requests = <String>[];
+    server.listen((request) async {
+      requests.add(request.uri.path);
+      request.response.headers.contentType = ContentType.json;
+      request.response.write(metadata);
+      await request.response.close();
+    });
+    final browser = HfModelBrowser(
+      endpoint: Uri.parse('http://127.0.0.1:${server.port}'),
+    );
+    addTearDown(() async {
+      browser.close();
+      await server.close(force: true);
+    });
+    await browser.selectRepository(
+      'convaiinnovations/laya-multilingual',
+      revision: revision,
+    );
+    final original = browser.state.repository!;
+    expect(original.revision, revision);
+    expect(requests, [
+      '/api/models/convaiinnovations/laya-multilingual/revision/$revision',
+    ]);
+    final repository = HfRepositoryFiles(
+      summary: original.summary,
+      revision: original.revision,
+      requestedRevision: original.requestedRevision,
+      source: original.source,
+      files: [
+        ...original.files,
+        const HfModelFile(path: 'other-model/model.safetensors', sizeBytes: 99),
+        const HfModelFile(path: 'other-model/config.json', sizeBytes: 2),
+        const HfModelFile(path: 'other-model/tokenizer.json', sizeBytes: 2),
+        const HfModelFile(path: 'quantized/model-Q8_0.gguf', sizeBytes: 99),
+      ],
+    );
+    final variant = ModelPackage.discover(repository)
+        .singleWhere((package) => package.directory.isEmpty)
+        .variants
+        .single;
+    expect(variant.resolution, PackageResolution.resolved);
+    expect(variant.canDownload, isTrue);
+    expect(variant.sizeBytes, 678201774);
+    expect(variant.files.map((file) => file.path).toSet(), {
+      'config.json',
+      'model.safetensors',
+      'rl_agent_config.json',
+      'encoder/config.json',
+      'tokenizer/tokenizer.json',
+      'tokenizer/tokenizer_config.json',
+    });
+    expect(
+      variant.files
+          .singleWhere((file) => file.path == 'tokenizer/tokenizer.json')
+          .sizeBytes,
+      34363188,
+    );
+    final missingVocabulary = HfRepositoryFiles(
+      summary: repository.summary,
+      revision: repository.revision,
+      requestedRevision: repository.requestedRevision,
+      source: repository.source,
+      files: repository.files
+          .where((file) => file.path != 'tokenizer/tokenizer.json')
+          .toList(),
+    );
+    final incomplete = ModelPackage.discover(missingVocabulary)
+        .singleWhere((package) => package.directory.isEmpty)
+        .variants
+        .single;
+    expect(incomplete.resolution, PackageResolution.incomplete);
+    expect(incomplete.canDownload, isFalse);
+  });
+
+  test('locally reused files retain their fixed lineage and upstream verification after a library scan', () async {
+    final root = await Directory.systemTemp.createTemp('jev-local-receipt-');
+    final existing = await writeDecisionKev(root);
+    final before = await existing.stat();
+    final digest = sha256.convert(await existing.readAsBytes()).toString();
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    var requests = 0;
+    server.listen((request) async {
+      requests++;
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      await request.response.close();
+    });
+    final endpoint = Uri.parse('http://127.0.0.1:${server.port}');
+    final downloader = ModelDownloader(
+      hfEndpoint: endpoint,
+      lmStudioEndpoint: endpoint,
+    );
+    final library = ModelLibrary();
+    addTearDown(() async {
+      await downloader.close();
+      library.close();
+      await server.close(force: true);
+      await root.delete(recursive: true);
+    });
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(
+        id: 'author/Kev',
+        license: 'apache-2.0',
+      ),
+      revision: _revision,
+      requestedRevision: 'main',
+      source: endpoint,
+      files: [
+        HfModelFile(
+          path: 'Kev-Q8_0.gguf',
+          sizeBytes: before.size,
+          sha256: digest,
+          isLfs: true,
+        ),
+      ],
+    );
+    final package = ModelPackage.discover(repository).single;
+    await downloader.downloadPackage(
+      selection: package.selectVariant(package.variants.single.id),
+      currentRepository: repository,
+      libraryDirectory: root,
+      source: DownloadSource.lmStudio,
+    );
+    expect(downloader.state.status, DownloadStatus.installed);
+    expect(downloader.state.reusedExisting, isTrue);
+    expect(requests, 0);
+    expect((await existing.stat()).modified, before.modified);
+    final receiptFile = File(
+      '${root.path}/.jevmanager/installations/${downloader.state.installationId}.json',
+    );
+    final receipt =
+        jsonDecode(await receiptFile.readAsString()) as Map<String, dynamic>;
+    expect(receipt['source'], 'local');
+    expect(receipt['sourceTransferPerformed'], isFalse);
+    final asset = (await library.scan(root, verifyFiles: true)).single;
+    expect(asset.repoId, 'author/Kev');
+    expect(asset.revision, _revision);
+    expect(asset.license, 'apache-2.0');
+    expect(asset.integrity, AssetIntegrity.complete);
+    expect(asset.sourceVerified, isTrue);
+    final changedBytes = await existing.readAsBytes();
+    changedBytes[changedBytes.length - 1] = 1;
+    await existing.writeAsBytes(changedBytes);
+    final changed = (await library.scan(root, verifyFiles: true)).single;
+    expect(changed.integrity, AssetIntegrity.corrupt);
+    expect(changed.sourceVerified, isFalse);
+    expect(
+      jsonDecode(await receiptFile.readAsString())['sourceTransferPerformed'],
+      isFalse,
+    );
+  });
+
   test('a GGUF quantization resolves its complete shards and companions', () {
     final repository = HfRepositoryFiles(
       summary: const HfRepositorySummary(id: 'publisher/model'),
@@ -139,94 +301,161 @@ void main() {
     },
   );
 
-  test(
-    'a Safetensors folder package resolves its index tokenizer and head',
-    () async {
-      final root = await Directory.systemTemp.createTemp('jev-package-');
-      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-      final bodies = {
-        'encoder/model.safetensors.index.json': '{"weight_map":{"layer.a":"alpha.safetensors","layer.b":"beta.safetensors"}}',
-        'encoder/alpha.safetensors': 'abc',
-        'encoder/beta.safetensors': 'def',
-        'encoder/unused-quant.safetensors': 'unselected',
-        'encoder/config.json': '{}',
-        'encoder/tokenizer.json': '{}',
-        'encoder/decision_head.npz': 'head',
-        'other-model/model.safetensors': 'other',
-        'other-model/config.json': '{}',
-        'other-model/tokenizer.json': '{}',
-      };
-      final requested = <String>[];
-      server.listen((request) async {
-        final path = request.uri.pathSegments.skip(4).join('/');
-        requested.add(path);
-        request.response.add(utf8.encode(bodies[path]!));
-        await request.response.close();
-      });
-      final endpoint = Uri.parse('http://127.0.0.1:${server.port}');
-      final downloader = ModelDownloader(hfEndpoint: endpoint);
-      addTearDown(() async {
-        downloader.close();
-        await server.close(force: true);
-        await root.delete(recursive: true);
-      });
-      final repository = HfRepositoryFiles(
-        summary: const HfRepositorySummary(id: 'publisher/model'),
-        revision: _revision,
-        requestedRevision: 'main',
-        source: endpoint,
-        files: bodies.entries
-            .map(
-              (entry) => HfModelFile(
-                path: entry.key,
-                sizeBytes: utf8.encode(entry.value).length,
-              ),
-            )
-            .toList(),
-      );
-      final packages = ModelPackage.discover(repository);
-      expect(packages.map((package) => package.directory).toSet(), {
-        'encoder',
-        'other-model',
-      });
-      final package = packages.singleWhere(
-        (package) => package.directory == 'encoder',
-      );
-      final variant = package.variants.single;
-      expect(variant.format, 'Safetensors');
-      expect(variant.canDownload, isTrue);
-      expect(variant.resolution, PackageResolution.indexed);
-      expect(variant.sizeBytes, isNull);
-      await downloader.downloadPackage(
-        selection: package.selectVariant(variant.id),
-        currentRepository: repository,
-        libraryDirectory: root,
-      );
-      expect(downloader.state.status, DownloadStatus.installed);
-      final expected = bodies.keys
-          .where(
-            (path) => path.startsWith('encoder/') && !path.contains('unused-'),
+  test('a Safetensors folder package resolves its index tokenizer and head', () async {
+    final root = await Directory.systemTemp.createTemp('jev-package-');
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    final bodies = {
+      'encoder/model.safetensors.index.json': '{"weight_map":{"layer.a":"alpha.safetensors","layer.b":"beta.safetensors"}}',
+      'encoder/alpha.safetensors': 'abc',
+      'encoder/beta.safetensors': 'def',
+      'encoder/unused-quant.safetensors': 'unselected',
+      'encoder/config.json': '{}',
+      'encoder/tokenizer.json': '{}',
+      'encoder/decision_head.npz': 'head',
+      'other-model/model.safetensors': 'other',
+      'other-model/config.json': '{}',
+      'other-model/tokenizer.json': '{}',
+    };
+    final requested = <String>[];
+    server.listen((request) async {
+      final path = request.uri.pathSegments.skip(4).join('/');
+      requested.add(path);
+      request.response.add(utf8.encode(bodies[path]!));
+      await request.response.close();
+    });
+    final endpoint = Uri.parse('http://127.0.0.1:${server.port}');
+    final downloader = ModelDownloader(hfEndpoint: endpoint);
+    addTearDown(() async {
+      downloader.close();
+      await server.close(force: true);
+      await root.delete(recursive: true);
+    });
+    final repository = HfRepositoryFiles(
+      summary: const HfRepositorySummary(id: 'publisher/model'),
+      revision: _revision,
+      requestedRevision: 'main',
+      source: endpoint,
+      files: bodies.entries
+          .map(
+            (entry) => HfModelFile(
+              path: entry.key,
+              sizeBytes: utf8.encode(entry.value).length,
+            ),
           )
-          .toSet();
-      expect(requested.toSet(), expected);
-      for (final path in expected) {
-        expect(
-          await File('${root.path}/publisher/model/$path').readAsString(),
-          bodies[path],
-        );
-      }
+          .toList(),
+    );
+    final packages = ModelPackage.discover(repository);
+    expect(packages.map((package) => package.directory).toSet(), {
+      'encoder',
+      'other-model',
+    });
+    final package = packages.singleWhere(
+      (package) => package.directory == 'encoder',
+    );
+    final variant = package.variants.single;
+    expect(variant.format, 'Safetensors');
+    expect(variant.canDownload, isTrue);
+    expect(variant.resolution, PackageResolution.indexed);
+    expect(variant.sizeBytes, isNull);
+    await downloader.downloadPackage(
+      selection: package.selectVariant(variant.id),
+      currentRepository: repository,
+      libraryDirectory: root,
+    );
+    expect(downloader.state.status, DownloadStatus.installed);
+    final expected = bodies.keys
+        .where(
+          (path) => path.startsWith('encoder/') && !path.contains('unused-'),
+        )
+        .toSet();
+    expect(requested.toSet(), expected);
+    final receipt = File(
+      '${root.path}/.jevmanager/installations/${downloader.state.installationId}.json',
+    );
+    final savedReceipt = await receipt.readAsString();
+    requested.clear();
+    await downloader.downloadPackage(
+      selection: package.selectVariant(variant.id),
+      currentRepository: repository,
+      libraryDirectory: root,
+    );
+    expect(downloader.state.status, DownloadStatus.installed);
+    expect(downloader.state.reusedExisting, isTrue);
+    expect(requested, isEmpty);
+    expect(await receipt.readAsString(), savedReceipt);
+    final forged = jsonDecode(savedReceipt) as Map<String, dynamic>;
+    (forged['files'] as List).removeLast();
+    await receipt.writeAsString(jsonEncode(forged));
+    await downloader.downloadPackage(
+      selection: package.selectVariant(variant.id),
+      currentRepository: repository,
+      libraryDirectory: root,
+    );
+    expect(downloader.state.status, DownloadStatus.conflict);
+    expect(requested, isEmpty);
+    expect(
+      jsonDecode(await receipt.readAsString())['files'],
+      hasLength(expected.length - 1),
+    );
+    await receipt.writeAsString(savedReceipt);
+    final existingShard = File(
+      '${root.path}/publisher/model/encoder/alpha.safetensors',
+    );
+    await existingShard.writeAsString('xyz');
+    await downloader.downloadPackage(
+      selection: package.selectVariant(variant.id),
+      currentRepository: repository,
+      libraryDirectory: root,
+    );
+    expect(downloader.state.status, DownloadStatus.conflict);
+    expect(requested, isEmpty);
+    expect(await existingShard.readAsString(), 'xyz');
+    await existingShard.writeAsString('abc');
+    final changedRevision = HfRepositoryFiles(
+      summary: repository.summary,
+      revision: '1111111111111111111111111111111111111111',
+      requestedRevision: 'main',
+      source: endpoint,
+      files: repository.files
+          .map(
+            (file) => file.path == 'encoder/alpha.safetensors'
+                ? const HfModelFile(
+                    path: 'encoder/alpha.safetensors',
+                    sizeBytes: 3,
+                    sha256: '3608bca1e44ea6c4d268eb6db02260269892c0b42b86bbf1e77a6fa16c3c9282',
+                  )
+                : file,
+          )
+          .toList(),
+    );
+    final newerPackage = ModelPackage.discover(changedRevision)
+        .singleWhere((model) => model.directory == 'encoder');
+    await downloader.downloadPackage(
+      selection: newerPackage.selectVariant(newerPackage.variants.single.id),
+      currentRepository: changedRevision,
+      libraryDirectory: root,
+    );
+    expect(downloader.state.status, DownloadStatus.conflict);
+    expect(requested, isEmpty);
+    expect(await existingShard.readAsString(), 'abc');
+    expect(await receipt.readAsString(), savedReceipt);
+    for (final path in expected) {
       expect(
-        await File(
-          '${root.path}/publisher/model/encoder/unused-quant.safetensors',
-        ).exists(),
-        isFalse,
+        await File('${root.path}/publisher/model/$path').readAsString(),
+        bodies[path],
       );
-      expect(
-        await Directory('${root.path}/publisher/model/other-model').exists(),
-        isFalse,
-      );
-    },
-  );
+    }
+    expect(
+      await File(
+        '${root.path}/publisher/model/encoder/unused-quant.safetensors',
+      ).exists(),
+      isFalse,
+    );
+    expect(
+      await Directory('${root.path}/publisher/model/other-model').exists(),
+      isFalse,
+    );
+  });
 
   test(
     'a model includes its sole projector and rejects ambiguous projectors',
